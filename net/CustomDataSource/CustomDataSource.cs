@@ -21,6 +21,7 @@ using System.Collections;
 using System.Data.Common;
 using System.Data.SQLite;
 using System.Data;
+using System.Text;
 
 /// <summary>
 ///  A simple custom data source that illustrates how data can be loaded
@@ -51,6 +52,101 @@ public class CustomDataSource : CustomOplDataSource
     private static readonly string DATA_FIELD = "data";
 
     /// <summary>
+    /// Interpolate model elements or environment variables into a string.
+    /// Character sequences like $(NAME) are replaced with the model element NAME.
+    /// Character sequences like ${NAME} are replaced with the environment variable NAME.
+    /// </summary>
+    /// <param name="text">The text in which the replacement happens.</param>
+    /// <param name="handler">The handler from which model elements are read.</param>
+    /// <returns></returns>
+    private static string Interpolate(string text, OplDataHandler handler)
+    {
+        // Return value
+        StringBuilder b = new StringBuilder(text.Length);
+        // The closing parenthesis we are looking for (or NUL)
+        char unquote = '\0';
+        // The text between open and closing parenthesis.
+        StringBuilder quoted = null;
+        // Was the last character a $
+        bool dollar = false;
+        foreach (char c in text)
+        {
+            if (unquote != '\0')
+            {
+                if (c == unquote)
+                {
+                    switch (unquote)
+                    {
+                        case ')':
+                            // Interpolate model element
+                            OplElement elem = handler.getElement(quoted.ToString());
+                            if (elem == null)
+                                throw new SystemException("undefined element " + quoted.ToString() + " referenced in " + text);
+                            if (elem.ElementType.Equals(OplElementType.Type.INT))
+                                b.Append(elem.AsInt());
+                            else if (elem.ElementType.Equals(OplElementType.Type.NUM))
+                                b.Append(elem.AsNum());
+                            else if (elem.ElementType.Equals(OplElementType.Type.STRING))
+                                b.Append(elem.AsString());
+                            else
+                                throw new SystemException("reference element " + quoted.ToString() + " has invalid type " + elem.ElementType);
+                            break;
+                        case '}':
+                            // Interpolate environment variable.
+                            string value = Environment.GetEnvironmentVariable(quoted.ToString());
+                            if (value != null)
+                                b.Append(value);
+                            break;
+                    }
+                    unquote = '\0';
+                    quoted = null;
+                }
+                else
+                {
+                    quoted.Append(c);
+                }
+            }
+            else if (c == '$')
+            {
+                if (dollar)
+                {
+                    // $$ is used to mean a literal $
+                    b.Append('$');
+                    dollar = false;
+                }
+                else
+                    dollar = true;
+            }
+            else if (dollar)
+            {
+                // last character was a $ but current one is not: we must start a quote
+                switch (c)
+                {
+                    case '(':
+                        unquote = ')';
+                        quoted = new StringBuilder();
+                        break;
+                    case '{':
+                        unquote = '}';
+                        quoted = new StringBuilder();
+                        break;
+                    default:
+                        throw new SystemException("ínvalid text " + text);
+                }
+                dollar = false;
+            }
+
+            else
+            {
+                b.Append(c);
+            }
+        }
+        if (dollar || unquote != '\0')
+            throw new SystemException("bad quotes in " + text);
+        return b.ToString();
+    }
+
+    /// <summary>
     ///  A row in a table of data.
     ///  An instance of this interface represents one row in the collection
     ///  that the IEnumerator<IRow> interface iterates over.
@@ -62,19 +158,19 @@ public class CustomDataSource : CustomOplDataSource
         /// </summary>
         /// <param name="idx">Index of element to query (0-based).</param>
         /// <returns>The element at position <code>idx</code> converted to <code>int</code></returns>
-        public int GetIntColumn(int idx);
+        int GetIntColumn(int idx);
         /// <summary>
         ///  Get the value of an element as floating point number.
         /// </summary>
         /// <param name="idx">Index of element to query (0-based).</param>
         /// <returns>The element at position <code>idx</code> converted to <code>double</code></returns>
-        public double GetFloatColumn(int idx);
+        double GetFloatColumn(int idx);
         /// <summary>
         ///  Get the value of an element as string.
         /// </summary>
         /// <param name="idx">Index of element to query (0-based).</param>
         /// <returns>The element at position <code>idx</code> converted to <code>string</code></returns>
-        public String GetStringColumn(int idx);
+        String GetStringColumn(int idx);
     }
     /// <summary>
     /// Interface that is implemented by all the data providers here.
@@ -149,8 +245,10 @@ public class CustomDataSource : CustomOplDataSource
         // by a database, then this string can be used to specify
         // locations and/or credentials.
         string connection = tuple.GetStringValue(CONN_FIELD);
+        connection = Interpolate(connection, handler);
 
         string connectionType = tryLoadField(tuple, TYPE_FIELD, "SimpleData");
+        connectionType = Interpolate(connectionType, handler);
         IDataProvider provider = null;
         if (connectionType.Equals("SimpleData"))
             provider = new SimpleData(connection);
@@ -161,14 +259,15 @@ public class CustomDataSource : CustomOplDataSource
 
         // Process each of load specifications and load the respective
         // element.
-        using (provider) {
+        using (provider)
+        {
             ISymbolSet data = tuple.GetSymbolSetValue(DATA_FIELD);
             IEnumerator e = data.GetEnumerator();
             while (e.MoveNext())
             {
                 // Split specification into element name and
                 // initialiation string (statement).
-                string s = e.Current.ToString().Trim();
+                string s = Interpolate(e.Current.ToString().Trim(), handler);
                 int eq = s.IndexOf('=');
                 string name = s.Substring(0, eq).Trim();
                 string stmt = s.Substring(eq + 1).Trim();
@@ -316,7 +415,7 @@ public class CustomDataSource : CustomOplDataSource
     /// <summary>
     ///  Load a collection or array of primitive types.
     /// </summary>
-    private void loadPrimitiveCollection(OplDataHandler handler, string name, IEnumerator<IRow> rows, Action<OplDataHandler> startCollection, Action<OplDataHandler> endCollection, Action<OplDataHandler,IRow,int> setValue)
+    private void loadPrimitiveCollection(OplDataHandler handler, string name, IEnumerator<IRow> rows, Action<OplDataHandler> startCollection, Action<OplDataHandler> endCollection, Action<OplDataHandler, IRow, int> setValue)
     {
         handler.StartElement(name);
         startCollection(handler);
@@ -374,7 +473,7 @@ public class CustomDataSource : CustomOplDataSource
             public int GetIntColumn(int idx) => int.Parse(data[idx].Trim());
             public string GetStringColumn(int idx) => data[idx];
 
-            override public string ToString() { return String.Join(',', data); }
+            override public string ToString() { return String.Join(",", data); }
         }
 
         private class RowIterator : IEnumerator<IRow>
@@ -465,7 +564,7 @@ public class CustomDataSource : CustomOplDataSource
             {
                 if (reader != null)
                 {
-                    reader.DisposeAsync();
+                    reader.Close();
                     reader = null;
                 }
 
@@ -534,33 +633,29 @@ public class CustomDataSource : CustomOplDataSource
         /// connection from the connection factory.</param>
         public GenericData(string conntype, string connstr)
         {
+            DbProviderFactory factory = null;
             // In order to have the code self-contained, we explicitly register
             // the SQLite provider factory here. In production code this registration
             // should of course be done in some global system configuration.
-            string sqlite = "System.Data.SQLite";
-            try
-            {
-                DbProviderFactories.GetFactory(sqlite);
-            }
-            catch (SystemException)
-            {
-                DbProviderFactories.RegisterFactory(sqlite, new SQLiteFactory());
-            }
+            if (conntype.Equals("System.Data.SQLite"))
+                factory = new SQLiteFactory();
 
             // Find a provider factory for conntype.
-            System.Data.DataTable allFactories = DbProviderFactories.GetFactoryClasses();
-            DbProviderFactory factory = null;
-            foreach (DataRow r in allFactories.Rows)
+            if (factory == null)
             {
-                // Potentially check whether this is the correct provider for
-                // this connection type
-                if (false)
+                System.Data.DataTable allFactories = DbProviderFactories.GetFactoryClasses();
+                foreach (DataRow r in allFactories.Rows)
                 {
-                    factory = DbProviderFactories.GetFactory(r);
-                    break;
+                    // Potentially check whether this is the correct provider for
+                    // this connection type
+                    if (false)
+                    {
+                        factory = DbProviderFactories.GetFactory(r);
+                        break;
+                    }
                 }
             }
-                
+
             if (factory == null)
                 factory = DbProviderFactories.GetFactory(conntype);
 
@@ -600,7 +695,7 @@ public class CustomDataSource : CustomOplDataSource
             {
                 if (reader != null)
                 {
-                    reader.DisposeAsync();
+                    reader.Close();
                     reader = null;
                 }
 
